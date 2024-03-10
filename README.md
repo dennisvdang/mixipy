@@ -12,7 +12,7 @@ mixipy is a Python library that provides a Pythonic interface to the audio proce
 
 ## About
 
-mixipy is inspired by the popular librosa library and aims to bridge the gap between the latest developments in the Mixxx ecosystem and the Python programming language. It empowers researchers, artists, and developers to work with audio data efficiently and effectively.
+mixipy is inspired by the python librosa library and aims to bridge the gap between the latest developments in the Mixxx ecosystem and the Python programming language. It empowers researchers, artists, and developers to work with audio data efficiently and effectively.
 
 mixipy is suitable for various audio-centric projects, including:
 
