@@ -1,6 +1,31 @@
 import librosa
 import numpy as np
-from scipy.stats import entropy
+from scipy.stats import entropy, mode
+from scipy.signal import hanning, fftconvolve
+from scipy.fftpack import fft
+
+EPS = 1e-10  # A small epsilon value to avoid log(0)
+
+def adaptive_threshold(data):
+    sz = len(data)
+    if sz == 0:
+        return data
+
+    smoothed = np.copy(data)
+    p_pre = 8
+    p_post = 7
+
+    for i in range(sz):
+        first = max(0, i - p_pre)
+        last = min(sz - 1, i + p_post)
+        smoothed[i] = np.mean(data[first:last + 1])
+
+    for i in range(sz):
+        data[i] -= smoothed[i]
+        if data[i] < 0.0:
+            data[i] = 0.0
+    return data
+
 
 def estimate_time_signature(beat_times, sr, hop_length):
     """
@@ -28,7 +53,7 @@ def estimate_time_signature(beat_times, sr, hop_length):
 
     return time_signature
 
-def find_downbeats(y, sr, hop_length, beat_times, time_signature):
+def find_downbeats(audio, beats, increment, factor, beatframesize, bpb):
     """
     Finds the downbeat locations using the spectral difference approach.
 
@@ -42,72 +67,129 @@ def find_downbeats(y, sr, hop_length, beat_times, time_signature):
     Returns:
         np.ndarray: The downbeat times in seconds.
     """
-    # Beat frame size is the next power of two up from 1.3 seconds at the downsampled rate
-    beat_frame_size = int(librosa.time_to_frames(1.3, sr=sr, hop_length=hop_length))
-    beat_frame_size = 2 ** np.ceil(np.log2(beat_frame_size))
+    if len(audio) == 0:
+        return []
 
-    # Convert beat times to frames
-    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop_length)
+    oldspec = np.zeros(beatframesize // 2)
+    beatsd = []
 
-    # Compute the spectral difference between beat frames
-    beat_sd = []
-    old_spec = None
-    for i in range(len(beat_frames) - 1):
-        start = beat_frames[i]
-        end = beat_frames[i + 1]
-        beat_frame = y[start:end]
+    for i in range(len(beats) - 1):
+        beatstart = int((beats[i] * increment) // factor)
+        beatend = int((beats[i + 1] * increment) // factor)
+        if beatend >= len(audio):
+            beatend = len(audio) - 1
+        if beatend < beatstart:
+            beatend = beatstart
 
-        # Apply Hanning window
-        beat_len = end - start
-        window = np.hanning(beat_len)
-        beat_frame *= window
+        beatlen = beatend - beatstart
+        beatframe = audio[beatstart:beatend] * hanning(beatlen)
+        beatframe = np.pad(beatframe, (0, beatframesize - len(beatframe)), mode='constant')
 
-        # Compute FFT
-        fft_frame = np.fft.rfft(beat_frame, n=beat_frame_size)
-        new_spec = np.abs(fft_frame)[:beat_frame_size // 2]
+        fft_out = fft(beatframe)
+        newspec = np.abs(fft_out[:beatframesize // 2])
 
-        # Adaptive thresholding
-        new_spec[new_spec < np.max(new_spec) / 10] = 0
+        newspec = adaptive_threshold(newspec)
 
-        # Calculate Jensen-Shannon divergence between new and old spectral frames
-        if old_spec is not None:
-            beat_sd.append(jensen_shannon_divergence(old_spec, new_spec))
+        if i > 0:
+            beatsd.append(measure_spec_diff(oldspec, newspec))
 
-        old_spec = new_spec
+        oldspec = np.copy(newspec)
 
-    # Find the beat transition with the greatest spectral change
-    dbcand = np.zeros(time_signature)
-    for beat in range(time_signature):
+    timesig = bpb if bpb != 0 else 4
+    dbcand = np.zeros(timesig)
+
+    for beat in range(timesig):
         count = 0
-        for example in range(beat - 1, len(beat_sd), time_signature):
+        for example in range(beat - 1, len(beatsd), timesig):
             if example < 0:
                 continue
-            dbcand[beat] += beat_sd[example] / time_signature
+            dbcand[beat] += (beatsd[example]) / timesig
             count += 1
         if count > 0:
             dbcand[beat] /= count
 
-    # First downbeat is the beat at the index of the maximum value of dbcand
     dbind = np.argmax(dbcand)
+    downbeats = [i for i in range(dbind, len(beats), timesig)]
 
-    # Remaining downbeats are at time_signature intervals from the first
-    downbeat_times = [beat_times[dbind]]
-    for i in range(dbind + time_signature, len(beat_times), time_signature):
-        downbeat_times.append(beat_times[i])
+    return downbeats
 
-    return np.array(downbeat_times)
+def measure_spec_diff(oldspec, newspec):
+    # JENSEN-SHANNON DIVERGENCE BETWEEN SPECTRAL FRAMES
+    SPECSIZE = 512  # ONLY LOOK AT FIRST 512 SAMPLES OF SPECTRUM.
+    if SPECSIZE > len(oldspec) // 4:
+        SPECSIZE = len(oldspec) // 4
+    
+    SD = 0.0
 
-def jensen_shannon_divergence(p, q):
-    """
-    Calculates the Jensen-Shannon divergence between two probability distributions.
+    # Add EPS to avoid taking log of 0
+    newspec = newspec[:SPECSIZE] + EPS
+    oldspec = oldspec[:SPECSIZE] + EPS
+    
+    sumnew = np.sum(newspec)
+    sumold = np.sum(oldspec)
+    
+    # Normalize the spectra
+    newspec /= sumnew
+    oldspec /= sumold
+    
+    # Replace any remaining zeros with ones (after normalization, this shouldn't happen, but just in case)
+    newspec = np.where(newspec == 0, 1.0, newspec)
+    oldspec = np.where(oldspec == 0, 1.0, oldspec)
+    
+    # Jensen-Shannon calculation
+    m = 0.5 * (oldspec + newspec)
+    SD = np.sum(-m * np.log(m) + 0.5 * (oldspec * np.log(oldspec)) + 0.5 * (newspec * np.log(newspec)))
+    
+    return SD
 
-    Args:
-        p (np.ndarray): The first probability distribution.
-        q (np.ndarray): The second probability distribution.
+def __beat_track_dp(localscore, period, tightness, time_signature, downbeat_frames):
+    """Core dynamic program for beat tracking with time signature and downbeats"""
+    backlink = np.zeros_like(localscore, dtype=int)
+    cumscore = np.zeros_like(localscore)
 
-    Returns:
-        float: The Jensen-Shannon divergence between `p` and `q`.
-    """
-    m = 0.5 * (p + q)
-    jsd = 0.5 * (entropy(p, m) + entropy(q, m))
-    return jsd
+    # Search range for previous beat
+    window = np.arange(-2 * period, -np.round(period / 2) + 1, dtype=int)
+
+    # Make a score window, which begins biased toward start_bpm and skewed
+    if tightness <= 0:
+        raise ParameterError("tightness must be strictly positive")
+
+    txwt = -tightness * (np.log(-window / period) ** 2)
+
+    # Are we on the first beat?
+    first_beat = True
+    for i, score_i in enumerate(localscore):
+        # Are we reaching back before time 0?
+        z_pad = np.maximum(0, min(-window[0], len(window)))
+
+        # Search over all possible predecessors
+        candidates = txwt.copy()
+        candidates[z_pad:] = candidates[z_pad:] + cumscore[window[z_pad:]]
+
+        # Adjust scores based on time signature and downbeats
+        if i in downbeat_frames:
+            # Encourage the selection of downbeats
+            candidates += 0.1 * localscore.max()
+        else:
+            # Penalize non-downbeat locations
+            beat_location_in_measure = (i - downbeat_frames[downbeat_frames <= i][-1]) % time_signature
+            if beat_location_in_measure != 0:
+                candidates -= 0.05 * localscore.max()
+
+        # Find the best preceding beat
+        beat_location = np.argmax(candidates)
+
+        # Add the local score
+        cumscore[i] = score_i + candidates[beat_location]
+
+        # Special case the first onset.  Stop if the localscore is small
+        if first_beat and score_i < 0.01 * localscore.max():
+            backlink[i] = -1
+        else:
+            backlink[i] = window[beat_location]
+            first_beat = False
+
+        # Update the time range
+        window = window + 1
+
+    return backlink, cumscore
